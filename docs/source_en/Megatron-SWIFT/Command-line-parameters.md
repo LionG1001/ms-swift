@@ -456,6 +456,8 @@ Used in GKD and GRPO.
 - teacher_model_server: Teacher model service URL. Deploy via `swift deploy` for logprobs; mutually exclusive with `teacher_model`. Single URL or multi-teacher JSON (`'[{"url":"...","tags":["..."]}, ...]'`). See [distillation docs](../Instruction/Distillation.md#multi-teacher-routing).
 - teacher_tag_key: Column name for multi-teacher routing (match sample values to teacher `tags`). Default is `"dataset"`.
 - offload_teacher_model: Whether to offload teacher model to CPU to save GPU memory. Default is False.
+- gkd_teacher_payload_mode: Local teacher output format, default `logits`. Experimental `hidden_states` captures actual pre-head states and reconstructs the full vocabulary; requires a separate frozen teacher and TP=PP=CP=1. See [GKD](./GKD.md#experimental-hidden-state-teacher-outputs).
+- gkd_lm_head_precision: Default `native`. `float32` enables actual FP32 Teacher/Student final projection and head reconstruction in the hidden-state path; requires no bias/gradient fusion and TP=PP=CP=1.
 
 ## Export Parameters
 

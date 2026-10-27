@@ -61,6 +61,8 @@ class RLHFMegatronArgumentsMixin:
     lmbda: float = 0.5  # On-policy probability: with prob lmbda, use student-generated responses
     seq_kd: bool = False  # Deprecated
     offload_teacher_model: bool = False  # Offload teacher model to CPU to save GPU memory
+    gkd_teacher_payload_mode: Literal['logits', 'hidden_states'] = 'logits'
+    gkd_lm_head_precision: Literal['native', 'float32'] = 'native'
     sft_alpha: float = 0.0  # Weight for SFT loss in GKD (0 = pure JSD, >0 = JSD + sft_alpha * SFT)
 
     # OPD-RL (On-Policy Distillation as RL): a teacher (teacher_model / teacher_model_server)

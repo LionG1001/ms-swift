@@ -432,6 +432,8 @@ Megatron训练参数继承自Megatron参数和基本参数（**与ms-swift共用
 - teacher_model_server: 教师模型服务地址，通过 `swift deploy` 部署后用于获取 logprobs，与 `teacher_model` 互斥。支持单 URL 或多 teacher JSON（`'[{"url":"...","tags":["..."]}, ...]'`）。详见[蒸馏文档](../Instruction/Distillation.md#multi-teacher多教师路由)。
 - teacher_tag_key: 多 teacher 路由时样本匹配 teacher `tags` 的字段名，默认为 `"dataset"`。
 - offload_teacher_model: 是否将教师模型卸载到 CPU 以节省 GPU 显存。默认为False。
+- gkd_teacher_payload_mode: 本地教师输出格式，默认`logits`；实验性`hidden_states`捕获实际pre-head状态并重建全词表，要求独立冻结教师及TP=PP=CP=1，详见[GKD](./GKD.md#实验性-hidden-state-教师输出)。
+- gkd_lm_head_precision: 默认`native`；`float32`为hidden-state路径的实际Teacher／Student最后投影及head重建启用FP32，要求无bias、无梯度融合及TP=PP=CP=1。
 
 
 ## 导出参数
