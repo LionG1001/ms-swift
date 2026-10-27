@@ -1,13 +1,17 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import hashlib
+import json
 import os
 import random
 import torch
 import torch.nn.functional as F
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from mcore_bridge import set_random_seed
 from megatron.core import mpu
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.utils import get_attr_wrapped_model
+from pathlib import Path
 from transformers.utils import ContextManagers
 from typing import Dict, List, Optional
 
@@ -17,6 +21,8 @@ from swift.rl_core.resample import resample_encode_failed_inputs
 from swift.rlhf_trainers.gkd_helpers import (assemble_teacher_output, build_opsd_samples, build_teacher_requests,
                                              encode_gkd_samples, fetch_teacher_parsed_by_routing)
 from swift.rlhf_trainers.gkd_loss import DataSource, TeacherOutput, gkd_loss
+from swift.rlhf_trainers.teacher_payload import (PreHeadTeacherProvider, TeacherHeadStore, TeacherIdentity,
+                                                 TeacherRequest, head_fingerprint)
 from swift.template import Template
 from swift.utils import get_logger, to_device
 from ..utils import forward_step_helper, get_padding_to
@@ -27,6 +33,34 @@ from .utils import gather_object
 from .vocab_parallel_utils import vocab_parallel_kl_div, vocab_parallel_log_softmax
 
 logger = get_logger()
+
+
+def _enable_fp32_gkd_head(head):
+    """Use differentiable FP32 projection without replacing shared parameters.
+
+    The initial correctness path is limited to an unbiased, non-fused TP1
+    output layer. The original BF16 parameter remains in the optimizer and
+    its FP32 cast stays on the autograd graph.
+    """
+    if not isinstance(head, ColumnParallelLinear) or mpu.get_tensor_model_parallel_world_size() != 1:
+        raise ValueError('FP32 GKD head projection requires a ColumnParallelLinear with TP=1.')
+    if head.bias is not None or head.sequence_parallel or head.gradient_accumulation_fusion:
+        raise ValueError('FP32 GKD head projection requires no bias, sequence parallelism, or gradient fusion.')
+    if getattr(head, '_swift_gkd_head_precision', None) == 'float32':
+        return
+
+    def forward(input_, weight=None, runtime_gather_output=None, **kwargs):
+        if kwargs.get('output_cross_entropy_loss') or kwargs.get('labels') is not None:
+            raise ValueError('The FP32 GKD head path returns full logits, not fused cross entropy.')
+        actual_weight = weight if weight is not None else head.weight
+        if actual_weight is None:
+            raise ValueError('A real output-head weight is required, including tied embeddings.')
+        with torch.autocast(input_.device.type, enabled=False):
+            output = F.linear(input_.float(), actual_weight.float())
+        return output, None
+
+    head.forward = forward
+    head._swift_gkd_head_precision = 'float32'
 
 
 class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
@@ -48,6 +82,24 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         # GKD top-k logits configuration
         self.gkd_logits_topk = getattr(args, 'gkd_logits_topk', None)
+        self.teacher_payload_mode = args.gkd_teacher_payload_mode
+        if args.gkd_lm_head_precision != 'native' and self.teacher_payload_mode != 'hidden_states':
+            raise ValueError('FP32 GKD head projection currently requires hidden-state Teacher payloads.')
+        self.teacher_provider = None
+        self.teacher_head_store = None
+        self.teacher_identity = None
+        self.teacher_checkpoint_id = None
+        self.teacher_tokenizer_id = None
+        self.teacher_payload_last_check = None
+        if self.teacher_payload_mode == 'hidden_states':
+            if self.use_teacher_api or self._is_self_distillation or self._teacher_use_disable_adapter:
+                raise ValueError('Hidden-state payloads currently require a separate frozen local Teacher.')
+            if self.gkd_logits_topk is not None:
+                raise ValueError('Hidden-state payloads require the complete vocabulary, not Top-K.')
+            if any(
+                    getattr(args, name) != 1 for name in ('tensor_model_parallel_size', 'pipeline_model_parallel_size',
+                                                          'context_parallel_size')):
+                raise ValueError('Local hidden-state payloads currently support TP=PP=CP=1 only.')
 
         self.use_vllm = getattr(args, 'use_vllm', False)
         self.steps_per_generation = args.steps_per_generation
@@ -84,6 +136,26 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         elif self._is_self_distillation:
             logger.info('Self-distillation mode: using student model as teacher (no separate teacher loaded)')
         self._load_teacher_model()
+        if self.teacher_payload_mode == 'hidden_states':
+            if self.args.gkd_lm_head_precision == 'float32':
+                for model in [*self.unwrapped_models, *self.teacher_models]:
+                    _enable_fp32_gkd_head(get_attr_wrapped_model(model, 'output_layer'))
+            head = get_attr_wrapped_model(self.teacher_models[0], 'output_layer')
+            self.teacher_provider = PreHeadTeacherProvider(head, input_layout='SBH')
+            self.teacher_head_store = TeacherHeadStore()
+            source = Path(self.args.teacher_model_dir)
+            weight_files = sorted(source.glob('*.safetensors')) or sorted(source.glob('pytorch_model*.bin'))
+            if not weight_files:
+                raise ValueError('A fingerprintable local Teacher checkpoint is required for hidden-state payloads.')
+            digest = hashlib.sha256()
+            for path in [source / 'config.json', *weight_files]:
+                digest.update(path.name.encode())
+                with path.open('rb') as stream:
+                    for block in iter(lambda: stream.read(8 * 1024 * 1024), b''):
+                        digest.update(block)
+            self.teacher_checkpoint_id = digest.hexdigest()
+            vocabulary = json.dumps(self.template.tokenizer.get_vocab(), sort_keys=True, ensure_ascii=False)
+            self.teacher_tokenizer_id = hashlib.sha256(vocabulary.encode()).hexdigest()
 
     @contextmanager
     def _template_context(self, template: Template, max_length: Optional[int] = None):
@@ -258,11 +330,62 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 teacher_data = self._prepare_batch(teacher_batch, vp_stage)
                 teacher_data.pop('loss_scale', None)
                 teacher_labels = teacher_data.pop('labels', None)
-                teacher_logits = forward_step_helper(teacher_model, teacher_data)
+                capture = self.teacher_provider.capture() if self.teacher_provider is not None else nullcontext()
+                with capture:
+                    teacher_logits = forward_step_helper(teacher_model, teacher_data)
                 if teacher_logits is not None:
                     teacher_logits = teacher_logits.detach()
 
-                if topk is not None and teacher_logits is not None:
+                if self.teacher_provider is not None:
+                    if teacher_logits is None or teacher_labels is None or teacher_labels.ndim != 2:
+                        raise ValueError('Hidden-state payloads require local BSV logits and BS teacher labels.')
+                    if self.teacher_identity is None:
+                        weight, bias = self.teacher_provider.head_weight, self.teacher_provider.head_bias
+                        self.teacher_identity = TeacherIdentity(
+                            teacher_id=str(self.args.teacher_model_dir),
+                            checkpoint_id=self.teacher_checkpoint_id,
+                            head_version=head_fingerprint(weight, bias),
+                            tokenizer_id=self.teacher_tokenizer_id,
+                            template_id=str(self.args.template),
+                            projection_dtype=self.args.gkd_lm_head_precision)
+                        self.teacher_head_store.register(self.teacher_identity, weight, bias)
+                    batch, sequence = torch.meshgrid(
+                        torch.arange(teacher_labels.shape[0], device=teacher_labels.device),
+                        torch.arange(teacher_labels.shape[1], device=teacher_labels.device),
+                        indexing='ij')
+                    positions = torch.stack((batch, sequence), dim=-1)
+                    digest = hashlib.sha256()
+                    for value in (teacher_model_inputs['input_ids'], teacher_labels):
+                        digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+                    request = TeacherRequest(
+                        identity=self.teacher_identity,
+                        trajectory_id=digest.hexdigest(),
+                        policy_version=int(self.state.iteration),
+                        target_ids=teacher_labels.clone(),
+                        positions=positions,
+                        temperature=self.temperature)
+                    payload = self.teacher_provider.make_payload(request)
+                    # Keep a direct-logits reference during initial correctness
+                    # validation. This is not a fused-head or low-peak claim.
+                    rebuilt = self.teacher_head_store.project(payload, request)
+                    low_precision = rebuilt.dtype in (torch.bfloat16, torch.float16)
+                    atol, rtol = (0.0625, 1 / 128) if low_precision else (1e-4, 1e-5)
+                    torch.testing.assert_close(rebuilt.float(), teacher_logits.float(), atol=atol, rtol=rtol)
+                    error = (rebuilt.float() - teacher_logits.float()).abs()
+                    self.teacher_payload_last_check = dict(
+                        max_abs=float(error.max()),
+                        mean_abs=float(error.mean()),
+                        atol=atol,
+                        rtol=rtol,
+                        capture_point=payload.capture_point,
+                        head_version=self.teacher_identity.head_version,
+                        trajectory_id=request.trajectory_id,
+                        policy_version=request.policy_version,
+                        checkpoint_id=self.teacher_checkpoint_id,
+                        dtype=str(rebuilt.dtype))
+                    self.teacher_payload_last_check['projection_dtype'] = self.teacher_identity.projection_dtype
+                    teacher_out = TeacherOutput(payload=payload, request=request, head_store=self.teacher_head_store)
+                elif topk is not None and teacher_logits is not None:
                     topk_logits, topk_indices = vocab_parallel_topk(teacher_logits, k=topk)
                     teacher_out = TeacherOutput(topk_logprobs=topk_logits, topk_indices=topk_indices)
                 else:

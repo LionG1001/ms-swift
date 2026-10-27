@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
+from .teacher_payload import TeacherHeadStore, TeacherPayload, TeacherRequest
+
 # ---------------------------------------------------------------------------
 # Data types — shared across all backends
 # ---------------------------------------------------------------------------
@@ -27,10 +29,17 @@ class TeacherOutput:
     topk_logprobs: Optional[torch.Tensor] = None
     topk_indices: Optional[torch.Tensor] = None
     labels: Optional[torch.Tensor] = None
+    payload: Optional[TeacherPayload] = None
+    request: Optional[TeacherRequest] = None
+    head_store: Optional[TeacherHeadStore] = None
 
     @property
     def is_topk_mode(self) -> bool:
         return self.topk_logprobs is not None and self.topk_indices is not None
+
+    @property
+    def is_hidden_mode(self) -> bool:
+        return self.payload is not None
 
     def to_device(self, device) -> 'TeacherOutput':
         """Move all tensor fields to ``device`` in place (Ray: teacher_output is
@@ -39,12 +48,21 @@ class TeacherOutput:
             v = getattr(self, name)
             if isinstance(v, torch.Tensor):
                 setattr(self, name, v.to(device))
+        if self.payload is not None:
+            self.payload = self.payload.to_device(device)
+        if self.request is not None:
+            self.request = self.request.to_device(device)
         return self
 
     def validate(self):
-        if self.full_logits is None and not self.is_topk_mode:
+        if self.is_hidden_mode:
+            if self.full_logits is not None or self.is_topk_mode:
+                raise ValueError('Hidden-state teacher output cannot also provide logits or Top-K.')
+            if self.request is None or self.head_store is None or self.labels is None:
+                raise ValueError('Hidden-state teacher output requires a request, frozen head store and labels.')
+        elif self.full_logits is None and not self.is_topk_mode:
             raise ValueError('TeacherOutput must provide either full_logits or '
-                             '(topk_logprobs, topk_indices). Got neither.')
+                             '(topk_logprobs, topk_indices), or a complete hidden-state payload. Got none.')
 
     def select(self, mask: torch.Tensor) -> 'TeacherOutput':
         """Select active positions by boolean mask."""
@@ -53,10 +71,15 @@ class TeacherOutput:
             topk_logprobs=self.topk_logprobs[mask] if self.topk_logprobs is not None else None,
             topk_indices=self.topk_indices[mask] if self.topk_indices is not None else None,
             labels=self.labels[mask] if self.labels is not None else None,
+            payload=self.payload.select(mask) if self.payload is not None else None,
+            request=self.request.select(mask) if self.request is not None else None,
+            head_store=self.head_store,
         )
 
     def to_topk(self, k: int, topk_fn=None) -> 'TeacherOutput':
         """Convert full logits to topk representation."""
+        if self.is_hidden_mode:
+            raise ValueError('Top-K conversion is not supported for a full-vocabulary hidden-state payload.')
         if self.is_topk_mode:
             return self
         fn = topk_fn or (lambda logits, k: torch.topk(logits, k=k, dim=-1))
@@ -207,6 +230,8 @@ def extract_active(
         t_mask = s_mask
     s_active = student_logits[s_mask]
     t_active = teacher_output.select(t_mask)
+    if t_active.is_hidden_mode and not torch.equal(labels[s_mask], t_active.request.target_ids):
+        raise ValueError('Student and teacher response token IDs differ.')
     if t_active.is_topk_mode:
         uncovered = torch.isinf(t_active.topk_logprobs).all(dim=-1)
         if uncovered.any():
@@ -252,6 +277,11 @@ def gkd_loss(
         (total_loss, num_valid) — unnormalized total and count of valid positions.
     """
     teacher_output.validate()
+    if teacher_output.is_hidden_mode:
+        if teacher_output.request.temperature != temperature:
+            raise ValueError('Teacher payload temperature does not match the loss temperature.')
+        if not torch.equal(labels.ne(-100).sum(-1), teacher_output.labels.ne(-100).sum(-1)):
+            raise ValueError('Student and teacher response counts differ within a sequence.')
     s_active, t_active, num_valid = extract_active(student_logits, teacher_output, labels)
 
     if t_active.is_topk_mode:
@@ -260,7 +290,16 @@ def gkd_loss(
         lsf, kdf = default_log_softmax, default_kl_div
     else:
         s_logits = s_active
-        t_logits = t_active.full_logits
+        if t_active.is_hidden_mode:
+            # Keep the stored head/projection dtype, but evaluate both complete
+            # distributions in FP32. A float student and BF16 teacher softmax
+            # would otherwise silently mix probability precisions.
+            s_logits = s_logits.float()
+            t_logits = t_active.head_store.project(t_active.payload, t_active.request).float()
+            if s_logits.shape[-1] != t_logits.shape[-1]:
+                raise ValueError('Hidden-state payloads require an identical, complete vocabulary.')
+        else:
+            t_logits = t_active.full_logits
         s_logits, t_logits = _align_vocab(s_logits, t_logits)
         lsf, kdf = log_softmax_fn, kl_div_fn
 
